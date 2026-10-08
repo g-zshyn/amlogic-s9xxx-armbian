@@ -13,7 +13,7 @@ concurrency:
 
 on:
   schedule:
-    # Weekly: rebuild only when Armbian tip or ophub 6.6.y kernel changed
+    # Weekly: rebuild only when Armbian stable (vYY.MM) or ophub 6.6.y kernel changed
     - cron: "17 3 * * 1"
   workflow_dispatch:
     inputs:
@@ -27,7 +27,7 @@ env:
   TZ: Etc/UTC
   ROOTFS_SCRIPT: compile-kernel/tools/script/docker/build_armbian_rootfs_file.sh
   ARMBIAN_REPO: armbian/build
-  ARMBIAN_REF: main
+  # Newest vYY.MM stable branch is resolved in prepare (not main).
   # Fixed product line (not ophub author default 6.12/6.18)
   SET_RELEASE: bookworm
   ARMBIAN_BOARD: s905d
@@ -50,11 +50,12 @@ jobs:
     timeout-minutes: 10
     outputs:
       skip: ${{ steps.fp.outputs.skip }}
+      armbian_ref: ${{ steps.fp.outputs.armbian_ref }}
       armbian_sha: ${{ steps.fp.outputs.armbian_sha }}
       kernel_ver: ${{ steps.fp.outputs.kernel_ver }}
       fingerprint: ${{ steps.fp.outputs.fingerprint }}
     steps:
-      - name: Resolve upstream fingerprint (Armbian tip + ophub 6.6.y)
+      - name: Resolve upstream fingerprint (Armbian stable + ophub 6.6.y)
         id: fp
         env:
           GH_TOKEN: ${{ github.token }}
@@ -65,6 +66,21 @@ jobs:
           api() { curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$1"; }
 
           FORCE="${IN_FORCE:-false}"
+
+          # Newest stable branch: vYY.MM (same rule as armbian-onecloud). Not main.
+          ARMBIAN_REF=$(
+            api "https://api.github.com/repos/${ARMBIAN_REPO}/git/matching-refs/heads/v" \
+              | jq -r '
+                  [.[] | .ref | ltrimstr("refs/heads/")
+                    | select(test("^v[0-9]+\\.[0-9]+$"))]
+                  | sort_by(ltrimstr("v") | split(".") | map(tonumber))
+                  | last
+                '
+          )
+          if [[ -z "${ARMBIAN_REF}" || "${ARMBIAN_REF}" == "null" ]]; then
+            echo "::error::Could not resolve Armbian stable branch (vYY.MM)"
+            exit 1
+          fi
 
           ARMBIAN_SHA=$(api "https://api.github.com/repos/${ARMBIAN_REPO}/commits/${ARMBIAN_REF}" | jq -r .sha)
           if [[ -z "${ARMBIAN_SHA}" || "${ARMBIAN_SHA}" == "null" ]]; then
@@ -94,7 +110,8 @@ jobs:
           if [[ "${EVENT_NAME}" == "schedule" && "${FORCE}" != "true" ]]; then
             LAST_BODY=$(api "https://api.github.com/repos/${{ github.repository }}/releases?per_page=10" \
               | jq -r 'map(select(.draft==false)) | .[0].body // empty')
-            if [[ -n "${LAST_BODY}" ]] && grep -Fq "Fingerprint: ${FINGERPRINT}" <<<"${LAST_BODY}"; then
+            # Release body wraps the value in markdown backticks; the needle must too.
+            if [[ -n "${LAST_BODY}" ]] && grep -Fq "Fingerprint: \`${FINGERPRINT}\`" <<<"${LAST_BODY}"; then
               echo "Schedule skip: fingerprint matches latest release (no upstream change)"
               SKIP=true
             else
@@ -104,6 +121,7 @@ jobs:
 
           {
             echo "skip=${SKIP}"
+            echo "armbian_ref=${ARMBIAN_REF}"
             echo "armbian_sha=${ARMBIAN_SHA}"
             echo "kernel_ver=${KERNEL_VER}"
             echo "fingerprint=${FINGERPRINT}"
@@ -117,6 +135,38 @@ jobs:
             echo "- Fingerprint: \`${FINGERPRINT}\`"
             echo "- Skip: \`${SKIP}\` (event=\`${EVENT_NAME}\`)"
           } >>"${GITHUB_STEP_SUMMARY}"
+
+  keepalive:
+    name: Keep schedule enabled
+    # Runs on every cron tick, including fingerprint skips (build is not a dependency).
+    # Skipped builds create no commits, and GitHub disables schedules in public repos
+    # after 60 days without repository activity. PUT .../enable is idempotent on an
+    # already-active workflow and refreshes that inactivity timer without a commit.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          workflow="build-armbian-arm64-server-image.yml"
+          code="$(
+            curl -sS -o /tmp/enable-body.txt -w "%{http_code}" -X PUT \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/enable"
+          )"
+          if [[ "${code}" != "204" ]]; then
+            echo "::error::Enable workflow failed: HTTP ${code}"
+            cat /tmp/enable-body.txt
+            exit 1
+          fi
+          echo "Re-enabled ${workflow} (HTTP ${code}, no commit)"
 
   build:
     name: build-armbian-bookworm
@@ -180,9 +230,11 @@ jobs:
         id: down
         working-directory: /builder
         if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        env:
+          ARMBIAN_REF: ${{ needs.prepare.outputs.armbian_ref }}
         run: |
           df -hT ${PWD}
-          git clone -q --single-branch --depth=1 --branch=${ARMBIAN_REF} https://github.com/${ARMBIAN_REPO}.git build
+          git clone -q --single-branch --depth=1 --branch="${ARMBIAN_REF}" https://github.com/${ARMBIAN_REPO}.git build
           cd build
           TIP="$(git rev-parse HEAD)"
           WANT="${{ needs.prepare.outputs.armbian_sha }}"
@@ -190,7 +242,7 @@ jobs:
             git fetch -q --depth=1 origin "${WANT}"
             git checkout -q "${WANT}"
           fi
-          echo "Checked out $(git rev-parse HEAD)"
+          echo "Checked out ${ARMBIAN_REF} @ $(git rev-parse HEAD)"
           cd ..
           ln -sf /builder/build ${{ github.workspace }}/build
           ln -sf /builder/build /home/runner/work/_actions/ophub/amlogic-s9xxx-armbian/main/build
@@ -270,7 +322,7 @@ jobs:
             - Board: `${{ env.ARMBIAN_BOARD }}`
             - Release: `${{ env.SET_RELEASE }}`
             - Kernel line: `${{ env.ARMBIAN_KERNEL }}` (resolved `${{ needs.prepare.outputs.kernel_ver }}`, auto_kernel=`${{ env.AUTO_KERNEL }}`)
-            - Armbian: `${{ env.ARMBIAN_REPO }}@${{ env.ARMBIAN_REF }}` (`${{ needs.prepare.outputs.armbian_sha }}`)
+            - Armbian: `${{ env.ARMBIAN_REPO }}@${{ needs.prepare.outputs.armbian_ref }}` (`${{ needs.prepare.outputs.armbian_sha }}`)
             - Fingerprint: `${{ needs.prepare.outputs.fingerprint }}`
             ### Applicable Platform
             - 🐧 `arm64`
