@@ -1,14 +1,17 @@
 #==========================================================================
 # Description: Build Armbian arm64 server image (Phicomm N1 / s905d)
 # Product line: bookworm + s905d + server + kernel 6.6.y (auto_kernel)
+# Manual runs may pick another kernel line; those go to a separate prerelease
+# tag (..._k<line>) and never touch the main 6.6.y release.
 # Copyright (C) 2021 https://github.com/ophub/amlogic-s9xxx-armbian
 #==========================================================================
 
 name: Build Armbian arm64 server image
 
-# One build at a time; cancel superseded runs (manual/schedule overlap)
+# One build at a time per kernel line; cancel superseded runs of the same line.
+# Schedule has no inputs, so it always lands in the 6.6.y group.
 concurrency:
-  group: armbian-s905d-bookworm-server
+  group: armbian-s905d-bookworm-server-${{ inputs.kernel || '6.6.y' }}
   cancel-in-progress: true
 
 on:
@@ -22,6 +25,15 @@ on:
         required: false
         default: false
         type: boolean
+      kernel:
+        description: "Kernel line. 6.6.y = main release; others publish a separate prerelease (tag suffix _k<line>)."
+        required: false
+        default: "6.6.y"
+        type: choice
+        options:
+          - "6.6.y"
+          - "6.12.y"
+          - "6.18.y"
 
 env:
   TZ: Etc/UTC
@@ -31,7 +43,9 @@ env:
   # Fixed product line (not ophub author default 6.12/6.18)
   SET_RELEASE: bookworm
   ARMBIAN_BOARD: s905d
-  ARMBIAN_KERNEL: 6.6.y
+  # Schedule has no inputs -> always 6.6.y. Manual runs use the chosen line.
+  ARMBIAN_KERNEL: ${{ inputs.kernel || '6.6.y' }}
+  DEFAULT_KERNEL: 6.6.y
   AUTO_KERNEL: "true"
   KERNEL_REPO: ophub/kernel
   KERNEL_USAGE: stable
@@ -55,7 +69,7 @@ jobs:
       kernel_ver: ${{ steps.fp.outputs.kernel_ver }}
       fingerprint: ${{ steps.fp.outputs.fingerprint }}
     steps:
-      - name: Resolve upstream fingerprint (Armbian stable + ophub 6.6.y)
+      - name: Resolve upstream fingerprint (Armbian stable + ophub kernel line)
         id: fp
         env:
           GH_TOKEN: ${{ github.token }}
@@ -88,7 +102,7 @@ jobs:
             exit 1
           fi
 
-          # Latest patch in the 6.6.y LTS line from ophub kernel_stable assets
+          # Latest patch in the selected kernel line (default 6.6.y) from ophub kernel_stable assets
           KERNEL_VERPATCH="$(echo "${ARMBIAN_KERNEL}" | awk -F. '{print $1"."$2}')"
           KERNEL_VER="$(
             curl -fsSL "https://github.com/${KERNEL_REPO}/releases/expanded_assets/kernel_${KERNEL_USAGE}" |
@@ -108,8 +122,9 @@ jobs:
 
           SKIP=false
           if [[ "${EVENT_NAME}" == "schedule" && "${FORCE}" != "true" ]]; then
-            LAST_BODY=$(api "https://api.github.com/repos/${{ github.repository }}/releases?per_page=10" \
-              | jq -r 'map(select(.draft==false)) | .[0].body // empty')
+            # Compare only against main releases; ignore kernel test prereleases (tag ..._k<line>).
+            LAST_BODY=$(api "https://api.github.com/repos/${{ github.repository }}/releases?per_page=20" \
+              | jq -r 'map(select(.draft==false and .prerelease==false and ((.tag_name // "") | test("_k[0-9]") | not))) | .[0].body // empty')
             # Release body wraps the value in markdown backticks; the needle must too.
             if [[ -n "${LAST_BODY}" ]] && grep -Fq "Fingerprint: \`${FINGERPRINT}\`" <<<"${LAST_BODY}"; then
               echo "Schedule skip: fingerprint matches latest release (no upstream change)"
@@ -273,7 +288,20 @@ jobs:
           rm -rf $(ls . | grep -v "^output$" | xargs) 2>/dev/null
 
           df -hT ${PWD}
-          echo "build_tag=Armbian_${SET_RELEASE}_arm64_${ARMBIAN_EDITION}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
+          # Non-default kernel -> separate prerelease tag, never marked latest.
+          tag_suffix=""
+          release_latest="true"
+          release_prerelease="false"
+          if [[ "${ARMBIAN_KERNEL}" != "${DEFAULT_KERNEL}" ]]; then
+            tag_suffix="_k${ARMBIAN_KERNEL%.y}"
+            release_latest="false"
+            release_prerelease="true"
+          fi
+          {
+            echo "build_tag=Armbian_${SET_RELEASE}_arm64_${ARMBIAN_EDITION}_$(date +"%Y.%m")${tag_suffix}"
+            echo "release_latest=${release_latest}"
+            echo "release_prerelease=${release_prerelease}"
+          } >> ${GITHUB_ENV}
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: Upload Armbian image to Release
@@ -285,7 +313,8 @@ jobs:
           allow_updates: true
           remove_artifacts: false
           replaces_artifacts: true
-          make_latest: true
+          make_latest: ${{ env.release_latest }}
+          prerelease: ${{ env.release_prerelease }}
           gh_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Rebuild Armbian for target boards
@@ -311,7 +340,8 @@ jobs:
           allow_updates: true
           remove_artifacts: false
           replaces_artifacts: true
-          make_latest: true
+          make_latest: ${{ env.release_latest }}
+          prerelease: ${{ env.release_prerelease }}
           gh_token: ${{ secrets.GITHUB_TOKEN }}
           body: |
             ### Armbian Image Information
