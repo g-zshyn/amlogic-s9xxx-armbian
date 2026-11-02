@@ -270,12 +270,25 @@ jobs:
         run: |
           docker run --rm --privileged multiarch/qemu-user-static --reset -p yes 2>/dev/null || true
 
-          cd build/
-              ./compile.sh RELEASE=${SET_RELEASE} BOARD=${CONFIG_BOARD} BRANCH=current BUILD_MINIMAL=no \
-                           BUILD_ONLY=default HOST=armbian BUILD_DESKTOP=no EXPERT=yes KERNEL_CONFIGURE=no \
-                           COMPRESS_OUTPUTIMAGE="sha" SHARE_LOG=yes
-
-          echo "status=success" >> ${GITHUB_OUTPUT}
+          for attempt in 1 2 3; do
+            echo "::group::compile attempt ${attempt}"
+            cd /builder/build
+            if ./compile.sh RELEASE=${SET_RELEASE} BOARD=${CONFIG_BOARD} BRANCH=current BUILD_MINIMAL=no \
+                 BUILD_ONLY=default HOST=armbian BUILD_DESKTOP=no EXPERT=yes KERNEL_CONFIGURE=no \
+                 COMPRESS_OUTPUTIMAGE="sha" SHARE_LOG=yes; then
+              echo "::endgroup::"
+              echo "status=success" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::compile attempt ${attempt} failed"
+            if [ "${attempt}" = "3" ]; then break; fi
+            rm -rf /builder/build/output 2>/dev/null || true
+            echo "waiting 60s before retry"
+            sleep 60
+          done
+          echo "::error::compile failed after 3 attempts"
+          exit 1
 
       - name: Organize output files and reclaim disk space
         id: clean
